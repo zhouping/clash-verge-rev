@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""
+Clash Verge CLI Controller
+通过终端命令控制 Clash Verge 代理的开启/停止/切换
+
+支持两种连接方式：
+1. Unix 套接字: /tmp/verge/verge-mihomo.sock (默认)
+2. HTTP API: http://127.0.0.1:9097 (需要启用 external-controller)
+"""
+
+import argparse
+import json
+import sys
+import socket
+import re
+
+# 配置
+DEFAULT_SOCKET_PATH = "/tmp/verge/verge-mihomo.sock"
+DEFAULT_API_HOST = "127.0.0.1"
+DEFAULT_API_PORT = 9097
+DEFAULT_SECRET = "set-your-secret"
+
+
+class ClashUnixClient:
+    """通过 Unix 套接字连接 Mihomo"""
+    
+    def __init__(self, socket_path=DEFAULT_SOCKET_PATH, secret=DEFAULT_SECRET):
+        self.socket_path = socket_path
+        self.secret = secret
+    
+    def _decode_chunked(self, body: bytes) -> str:
+        """解码 chunked 编码的 HTTP 响应"""
+        body_str = body.decode('utf-8')
+        result = ""
+        pos = 0
+        
+        while pos < len(body_str):
+            line_end = body_str.find('\r\n', pos)
+            if line_end == -1:
+                break
+            
+            chunk_hex = body_str[pos:line_end].strip()
+            try:
+                chunk_size = int(chunk_hex, 16)
+            except ValueError:
+                break
+            
+            if chunk_size == 0:
+                break
+            
+            pos = line_end + 2
+            result += body_str[pos:pos + chunk_size]
+            pos += chunk_size + 2
+        
+        return result
+    
+    def _fix_json(self, json_str: str) -> dict:
+        """修复截断的 JSON"""
+        # 首先找 proxies 键的位置
+        proxies_match = re.search(r'"proxies":\{', json_str)
+        if proxies_match:
+            start = proxies_match.start()
+            last_brace = json_str.rfind('}')
+            if last_brace > start:
+                return json.loads(json_str[:last_brace+1])
+        return json.loads(json_str)
+    
+    def _send_request(self, path: str, method: str = "GET", data: dict = None) -> dict:
+        """发送请求到 Unix 套接字"""
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect(self.socket_path)
+            
+            body = json.dumps(data).encode() if data else b""
+            req = f"{method} {path} HTTP/1.1\r\n"
+            req += f"Host: localhost\r\n"
+            req += f"Authorization: Bearer {self.secret}\r\n"
+            req += "Content-Type: application/json\r\n"
+            if data:
+                req += f"Content-Length: {len(body)}\r\n"
+            req += "Connection: close\r\n\r\n"
+            
+            if data:
+                req = req.encode() + body
+            else:
+                req = req.encode()
+            
+            sock.sendall(req)
+            
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            
+            sock.close()
+            
+            # 解析 HTTP 响应
+            if b"\r\n\r\n" in response:
+                header, body = response.split(b"\r\n\r\n", 1)
+            else:
+                header = response
+                body = b""
+            
+            # 检查 HTTP 状态码
+            status_line = header.split(b'\r\n')[0]
+            if b'204' in status_line or b'No Content' in status_line:
+                return {}  # 204 No Content 是正常的
+            
+            # 检查 chunked 编码
+            is_chunked = b"Transfer-Encoding: chunked" in header
+            if is_chunked and body:
+                body_str = self._decode_chunked(body)
+                if body_str:
+                    return self._fix_json(body_str)
+            
+            # 解析 JSON
+            if body:
+                try:
+                    return json.loads(body)
+                except json.JSONDecodeError:
+                    return self._fix_json(body.decode('utf-8', errors='ignore'))
+            
+            return {}
+        
+        except FileNotFoundError:
+            raise Exception(f"Unix 套接字不存在: {self.socket_path}")
+        except ConnectionRefusedError:
+            raise Exception(f"连接被拒绝: {self.socket_path}")
+        except Exception as e:
+            raise Exception(f"请求失败: {e}")
+    
+    def get_proxies(self) -> dict:
+        return self._send_request("/proxies")
+    
+    def get_proxy_groups(self) -> dict:
+        data = self.get_proxies()
+        # 原始返回 {"proxies": {...}} 结构
+        proxies = data.get("proxies", {}) if isinstance(data, dict) else data
+        groups = {}
+        for name, pdata in proxies.items():
+            if pdata.get("type") in ["Selector", "URLTest", "FallBack", "LoadBalance"]:
+                groups[name] = {
+                    "name": pdata.get("name"),
+                    "type": pdata.get("type"),
+                    "all": pdata.get("all", []),
+                    "now": pdata.get("now", "")
+                }
+        return groups
+    
+    def select_proxy(self, group: str, proxy_name: str) -> bool:
+        """切换代理节点 - 正确处理 204 响应"""
+        try:
+            result = self._send_request(f"/proxies/{group}", "PUT", {"name": proxy_name})
+            # 204 返回 {}, 不需要检查结果
+            return True
+        except Exception as e:
+            print(f"切换错误: {e}", file=sys.stderr)
+            return False
+    
+    def get_current_proxy(self, group: str) -> str:
+        proxies = self.get_proxies()
+        if group in proxies:
+            return proxies[group].get("now", "")
+        return ""
+    
+    def get_traffic(self) -> dict:
+        return self._send_request("/traffic")
+    
+    def get_config(self) -> dict:
+        return self._send_request("/configs")
+
+    def set_mode(self, mode: str) -> bool:
+        """切换 Clash Verge 的运行模式 (rule|global|direct)"""
+        try:
+            # Clash API 支持 PUT /configs 来更新整体配置
+            self._send_request("/configs", "PUT", {"mode": mode})
+            return True
+        except Exception as e:
+            print(f"切换模式错误: {e}", file=sys.stderr)
+            return False
+    
+    def get_logs(self, limit: int = 10) -> list:
+        return self._send_request(f"/logs?limit={limit}")
+
+
+def format_bytes(b):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if b < 1024:
+            return f"{b:.2f} {unit}"
+        b /= 1024
+    return f"{b:.2f} TB"
+
+
+def list_proxies(controller):
+    """列出所有代理"""
+    try:
+        groups = controller.get_proxy_groups()
+        if not groups:
+            print("未找到代理组，请确保 Clash Verge 正在运行")
+            return
+        
+        print("\n=== 代理组列表 ===")
+        for name, data in groups.items():
+            print(f"\n【{data['name']}】({data['type']})")
+            print(f"  当前: {data['now']}")
+            if data['all']:
+                print(f"  可用节点: {', '.join(data['all'][:8])}" + (f"..." if len(data['all']) > 8 else ""))
+    except Exception as e:
+        print(f"错误: {e}")
+
+
+def list_all_proxies(controller):
+    """列出所有代理包括直连和代理"""
+    try:
+        proxies = controller.get_proxies()
+        print("\n=== 所有代理 ===")
+        for name, data in sorted(proxies.items()):
+            proxy_type = data.get("type", "unknown")
+            now = data.get("now", "")
+            print(f"{name}: {proxy_type}" + (f" -> {now}" if now else ""))
+    except Exception as e:
+        print(f"错误: {e}")
+
+
+def show_status(controller):
+    """显示状态"""
+    try:
+        config = controller.get_config()
+        print("\n=== 配置状态 ===")
+        print(f"运行模式: {config.get('mode', 'N/A')}")
+        print(f"HTTP端口: {config.get('port', 'N/A')}")
+        print(f"SOCKS端口: {config.get('socks-port', 'N/A')}")
+        print(f"混合端口: {config.get('mixed-port', 'N/A')}")
+        print(f"允许LAN: {config.get('allow-lan', 'N/A')}")
+    except Exception as e:
+        print(f"获取状态失败: {e}")
+
+
+def show_traffic(controller):
+    """显示流量"""
+    try:
+        traffic = controller.get_traffic()
+        up = traffic.get("up", 0)
+        down = traffic.get("down", 0)
+        
+        print(f"\n↑ 上行: {format_bytes(up)}")
+        print(f"↓ 下行: {format_bytes(down)}")
+    except Exception as e:
+        print(f"获取流量失败: {e}")
+
+
+def switch_proxy(controller, group: str, proxy: str):
+    """切换代理"""
+    try:
+        if controller.select_proxy(group, proxy):
+            print(f"✓ 已切换 {group} -> {proxy}")
+        else:
+            print(f"✗ 切换失败")
+    except Exception as e:
+        print(f"错误: {e}")
+
+
+def interactive_mode(controller):
+    """交互模式"""
+    print("\n=== Clash Verge CLI 控制台 ===")
+    print("输入命令: list/listall/status/traffic/switch <组名> <节点>/quit")
+    print()
+    
+    while True:
+        try:
+            cmd = input("clash> ").strip()
+            if not cmd:
+                continue
+            
+            parts = cmd.split()
+            cmd_type = parts[0].lower()
+            
+            if cmd_type in ["quit", "exit", "q"]:
+                print("再见!")
+                break
+            
+            elif cmd_type == "list":
+                list_proxies(controller)
+            
+            elif cmd_type == "listall":
+                list_all_proxies(controller)
+            
+            elif cmd_type == "status":
+                show_status(controller)
+            
+            elif cmd_type == "traffic":
+                show_traffic(controller)
+            
+            elif cmd_type == "switch" and len(parts) >= 3:
+                switch_proxy(controller, parts[1], parts[2])
+            
+            elif cmd_type == "help":
+                print("可用命令:")
+                print("  list         - 列出代理组")
+                print("  listall      - 列出所有代理")
+                print("  status       - 显示配置状态")
+                print("  traffic      - 显示流量")
+                print("  switch <组> <节点> - 切换节点")
+                print("  quit         - 退出")
+            
+            else:
+                print(f"未知命令: {cmd}")
+                print("输入 help 查看帮助")
+        
+        except KeyboardInterrupt:
+            print("\n再见!")
+            break
+        except Exception as e:
+            print(f"错误: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Clash Verge CLI 控制器")
+    parser.add_argument("-s", "--socket", default=DEFAULT_SOCKET_PATH, help="Unix 套接字路径")
+    parser.add_argument("-H", "--host", default=DEFAULT_API_HOST, help="API 主机")
+    parser.add_argument("-p", "--port", type=int, default=DEFAULT_API_PORT, help="API 端口")
+    parser.add_argument("--secret", default=DEFAULT_SECRET, help="认证密钥")
+    parser.add_argument("--http", action="store_true", help="使用 HTTP 而非 Unix 套接字")
+    
+    subparsers = parser.add_subparsers(dest="command", help="子命令")
+    
+    subparsers.add_parser("list", help="列出代理组")
+    subparsers.add_parser("listall", help="列出所有代理")
+    mode_parser = subparsers.add_parser("mode", help="切换运行模式 (rule|global|direct)")
+    mode_parser.add_argument("mode", choices=["rule", "global", "direct"], help="目标模式")
+    # 其他子命令
+    subparsers.add_parser("status", help="显示配置状态")
+    subparsers.add_parser("traffic", help="显示流量统计")
+    switch_parser = subparsers.add_parser("switch", help="切换代理节点")
+    switch_parser.add_argument("group", help="代理组名称")
+    switch_parser.add_argument("proxy", help="代理节点名称")
+    subparsers.add_parser("interactive", help="交互模式")
+    subparsers.add_parser("i", help="交互模式(简写)")
+    
+    args = parser.parse_args()
+    
+    # 选择客户端
+    if args.http:
+        print("HTTP 模式暂未实现，使用 --socket 指定 Unix 套接字")
+    
+    controller = ClashUnixClient(args.socket, args.secret)
+    
+    # 执行命令
+    if args.command == "list":
+        list_proxies(controller)
+    elif args.command == "listall":
+        list_all_proxies(controller)
+    elif args.command == "status":
+        show_status(controller)
+    elif args.command == "traffic":
+        show_traffic(controller)
+    elif args.command == "switch":
+        switch_proxy(controller, args.group, args.proxy)
+    elif args.command == "mode":
+        if controller.set_mode(args.mode):
+            print(f"✓ 已切换模式到 {args.mode}")
+        else:
+            print("✗ 切换模式失败")
+    elif args.command in ["interactive", "i"]:
+        interactive_mode(controller)
+    else:
+        # 默认交互模式
+        interactive_mode(controller)
+
+
+if __name__ == "__main__":
+    main()
